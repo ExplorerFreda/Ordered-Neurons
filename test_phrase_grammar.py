@@ -1,18 +1,17 @@
 import argparse
 import re
 
-import matplotlib.pyplot as plt
 import nltk
 import numpy
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
+from tqdm import tqdm 
 
 import data
 import data_ptb
 from utils import batchify, get_batch, repackage_hidden, evalb
 
-from parse_comparison import corpus_stats_labeled, corpus_average_depth
 from data_ptb import word_tags
 
 
@@ -119,29 +118,12 @@ def mean(x):
     return sum(x) / len(x)
 
 
-def test(model, corpus, cuda, prt=False):
+def test(model, corpus, info, cuda, evalb_dir):
     model.eval()
 
-    prec_list = []
-    reca_list = []
-    f1_list = []
-
-    pred_tree_list = []
-    targ_tree_list = []
-
-    nsens = 0
-    word2idx = corpus.dictionary.word2idx
-    if args.wsj10:
-        dataset = zip(corpus.train_sens, corpus.train_trees, corpus.train_nltktrees)
-    else:
-        dataset = zip(corpus.test_sens, corpus.test_trees, corpus.test_nltktrees)
-
-    corpus_sys = {}
-    corpus_ref = {}
-    for sen, sen_tree, sen_nltktree in dataset:
-        if args.wsj10 and len(sen) > 12:
-            continue
-        x = numpy.array([word2idx[w] if w in word2idx else word2idx['<unk>'] for w in sen])
+    parse_trees = []
+    for sen, sen_tree in tqdm(list(zip(*info))):
+        x = numpy.array([corpus.dictionary[w] for w in sen])
         input = Variable(torch.LongTensor(x[:, None]))
         if cuda:
             input = input.cuda()
@@ -152,12 +134,6 @@ def test(model, corpus, cuda, prt=False):
         distance = model.distance[0].squeeze().data.cpu().numpy()
         distance_in = model.distance[1].squeeze().data.cpu().numpy()
 
-        nsens += 1
-        if prt and nsens % 100 == 0:
-            for i in range(len(sen)):
-                print('%15s\t%s\t%s' % (sen[i], str(distance[:, i]), str(distance_in[:, i])))
-            print('Standard output:', sen_tree)
-
         sen_cut = sen[1:-1]
         # gates = distance.mean(axis=0)
         for gates in [
@@ -167,78 +143,12 @@ def test(model, corpus, cuda, prt=False):
             # distance.mean(axis=0)
         ]:
             depth = gates[1:-1]
-            parse_tree = build_tree(depth, sen_cut)
+            sen = sen_tree.pos()
+            parse_tree = build_tree(depth, sen)
+            parse_trees.append(parse_tree)
 
-            corpus_sys[nsens] = MRG(parse_tree)
-            corpus_ref[nsens] = MRG_labeled(sen_nltktree)
+    return evalb(parse_trees, info[1], evalb_dir)
 
-            pred_tree_list.append(parse_tree)
-            targ_tree_list.append(sen_tree)
-
-            model_out, _ = get_brackets(parse_tree)
-            std_out, _ = get_brackets(sen_tree)
-            overlap = model_out.intersection(std_out)
-
-            prec = float(len(overlap)) / (len(model_out) + 1e-8)
-            reca = float(len(overlap)) / (len(std_out) + 1e-8)
-            if len(std_out) == 0:
-                reca = 1.
-                if len(model_out) == 0:
-                    prec = 1.
-            f1 = 2 * prec * reca / (prec + reca + 1e-8)
-            prec_list.append(prec)
-            reca_list.append(reca)
-            f1_list.append(f1)
-
-            if prt and nsens % 100 == 0:
-                print('Model output:', parse_tree)
-                print('Prec: %f, Reca: %f, F1: %f' % (prec, reca, f1))
-
-        if prt and nsens % 100 == 0:
-            print('-' * 80)
-
-            f, axarr = plt.subplots(3, sharex=True, figsize=(distance.shape[1] // 2, 6))
-            axarr[0].bar(numpy.arange(distance.shape[1])-0.2, distance[0], width=0.4)
-            axarr[0].bar(numpy.arange(distance_in.shape[1])+0.2, distance_in[0], width=0.4)
-            axarr[0].set_ylim([0., 1.])
-            axarr[0].set_ylabel('1st layer')
-            axarr[1].bar(numpy.arange(distance.shape[1]) - 0.2, distance[1], width=0.4)
-            axarr[1].bar(numpy.arange(distance_in.shape[1]) + 0.2, distance_in[1], width=0.4)
-            axarr[1].set_ylim([0., 1.])
-            axarr[1].set_ylabel('2nd layer')
-            axarr[2].bar(numpy.arange(distance.shape[1]) - 0.2, distance[2], width=0.4)
-            axarr[2].bar(numpy.arange(distance_in.shape[1]) + 0.2, distance_in[2], width=0.4)
-            axarr[2].set_ylim([0., 1.])
-            axarr[2].set_ylabel('3rd layer')
-            plt.sca(axarr[2])
-            plt.xlim(xmin=-0.5, xmax=distance.shape[1] - 0.5)
-            plt.xticks(numpy.arange(distance.shape[1]), sen, fontsize=10, rotation=45)
-
-            plt.savefig('figure/%d.png' % (nsens))
-            plt.close()
-
-    prec_list, reca_list, f1_list \
-        = numpy.array(prec_list).reshape((-1,1)), numpy.array(reca_list).reshape((-1,1)), numpy.array(f1_list).reshape((-1,1))
-    if prt:
-        print('-' * 80)
-        numpy.set_printoptions(precision=4)
-        print('Mean Prec:', prec_list.mean(axis=0),
-              ', Mean Reca:', reca_list.mean(axis=0),
-              ', Mean F1:', f1_list.mean(axis=0))
-        print('Number of sentence: %i' % nsens)
-
-        correct, total = corpus_stats_labeled(corpus_sys, corpus_ref)
-        print(correct)
-        print(total)
-        print('ADJP:', correct['ADJP'], total['ADJP'])
-        print('NP:', correct['NP'], total['NP'])
-        print('PP:', correct['PP'], total['PP'])
-        print('INTJ:', correct['INTJ'], total['INTJ'])
-        print(corpus_average_depth(corpus_sys))
-
-        evalb(pred_tree_list, targ_tree_list)
-
-    return f1_list.mean(axis=0)
 
 
 if __name__ == '__main__':

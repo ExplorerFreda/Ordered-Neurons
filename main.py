@@ -1,15 +1,19 @@
 import argparse
 import time
 import math
+import logging
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim.lr_scheduler as lr_scheduler
+from torch.utils.data import DataLoader, Dataset
 
 import data
+import data_ptb
 import model
+from utils import make_batch
+from test_phrase_grammar import test
 
-from utils import batchify, get_batch, repackage_hidden
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank RNN/LSTM Language Model')
 parser.add_argument('--data', type=str, default='data/penn/',
@@ -28,7 +32,7 @@ parser.add_argument('--lr', type=float, default=30,
                     help='initial learning rate')
 parser.add_argument('--clip', type=float, default=0.25,
                     help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=8000,
+parser.add_argument('--epochs', type=int, default=200,
                     help='upper epoch limit')
 parser.add_argument('--batch_size', type=int, default=80, metavar='N',
                     help='batch size')
@@ -67,10 +71,11 @@ parser.add_argument('--optimizer', type=str, default='sgd',
                     help='optimizer to use (sgd, adam)')
 parser.add_argument('--when', nargs="+", type=int, default=[-1],
                     help='When (which epochs) to divide the learning rate by 10 - accepts multiple')
-parser.add_argument('--finetuning', type=int, default=500,
+parser.add_argument('--finetuning', type=int, default=100,
                     help='When (which epochs) to switch to finetuning')
 parser.add_argument('--philly', action='store_true',
                     help='Use philly cluster')
+parser.add_argument('--evalb-dir', type=str, default='../EVALB/')
 args = parser.parse_args()
 args.tied = True
 
@@ -83,6 +88,19 @@ if torch.cuda.is_available():
     else:
         torch.cuda.manual_seed(args.seed)
 
+# construct loggers
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(formatter)
+logger.addHandler(console)
+handler = logging.FileHandler(args.save.replace('.pt', '.log'), 'w')
+handler.setLevel(logging.INFO)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.propagate = False
 
 ###############################################################################
 # Load data
@@ -106,28 +124,20 @@ def model_load(fn):
 import os
 import hashlib
 
-fn = 'corpus.{}.data'.format(hashlib.md5(args.data.encode()).hexdigest())
-if args.philly:
-    fn = os.path.join(os.environ['PT_OUTPUT_DIR'], fn)
-if os.path.exists(fn):
-    print('Loading cached dataset...')
-    corpus = torch.load(fn)
-else:
-    print('Producing dataset...')
-    corpus = data.Corpus(args.data)
-    torch.save(corpus, fn)
+corpus = data.Corpus(args.data)
+tree_corpus = data_ptb.Corpus(os.path.join(args.data, 'trees'))
 
 eval_batch_size = 10
 test_batch_size = 1
-train_data = batchify(corpus.train, args.batch_size, args)
-val_data = batchify(corpus.valid, eval_batch_size, args)
-test_data = batchify(corpus.test, test_batch_size, args)
+
+train_loader = DataLoader(corpus.train, args.batch_size, shuffle=True, collate_fn=data.collate_fn)
+val_loader = DataLoader(corpus.valid, args.batch_size, shuffle=False, collate_fn=data.collate_fn)
+test_loader = DataLoader(corpus.test, args.batch_size, shuffle=False, collate_fn=data.collate_fn)
+
 
 ###############################################################################
 # Build the model
 ###############################################################################
-
-from splitcross import SplitCrossEntropyLoss
 
 criterion = None
 
@@ -145,17 +155,7 @@ if args.resume:
             rnn.hh.dropout = args.wdrop
 ###
 if not criterion:
-    splits = []
-    if ntokens > 500000:
-        # One Billion
-        # This produces fairly even matrix mults for the buckets:
-        # 0: 11723136, 1: 10854630, 2: 11270961, 3: 11219422
-        splits = [4200, 35000, 180000]
-    elif ntokens > 75000:
-        # WikiText-103
-        splits = [2800, 20000, 76000]
-    print('Using', splits)
-    criterion = SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
+    criterion = nn.CrossEntropyLoss(ignore_index=corpus.dictionary.pad_id)
 ###
 if args.cuda:
     model = model.cuda()
@@ -171,49 +171,40 @@ print('Model total parameters:', total_params)
 # Training code
 ###############################################################################
 
-def evaluate(data_source, batch_size=10):
+def evaluate(data_loader, batch_size=10):
     # Turn on evaluation mode which disables dropout.
     model.eval()
-    if args.model == 'QRNN': model.reset()
-    total_loss = 0
-    ntokens = len(corpus.dictionary)
-    hidden = model.init_hidden(batch_size)
-    for i in range(0, data_source.size(0) - 1, args.bptt):
-        data, targets = get_batch(data_source, i, args, evaluation=True)
-        output, hidden = model(data, hidden)
-        total_loss += len(data) * criterion(model.decoder.weight, model.decoder.bias, output, targets).data
-        hidden = repackage_hidden(hidden)
-    return total_loss.item() / len(data_source)
-
+    with torch.no_grad():
+        if args.model == 'QRNN':
+            model.reset()
+        total_loss = 0
+        total_items = 0
+        for i, batch in enumerate(data_loader):
+            batch, targets, lengths = make_batch(batch)
+            hidden = model.init_hidden(batch.size(1))
+            output, hidden, rnn_hs, dropped_rnn_hs = model(batch, hidden, return_h=True)
+            decoded = model.decoder(output)
+            total_loss += criterion(decoded, targets.view(-1)) * batch.size(1)
+            total_items += batch.size(1)
+        return total_loss.item() / total_items
 
 def train():
+    model.train()
     # Turn on training mode which enables dropout.
-    if args.model == 'QRNN': model.reset()
+    if args.model == 'QRNN':
+        model.reset()
     total_loss = 0
+    total_items = 0
     start_time = time.time()
-    ntokens = len(corpus.dictionary)
-    hidden = model.init_hidden(args.batch_size)
-    batch, i = 0, 0
-    while i < train_data.size(0) - 1 - 1:
-        bptt = args.bptt if np.random.random() < 0.95 else args.bptt / 2.
-        # Prevent excessively small or negative sequence lengths
-        seq_len = max(5, int(np.random.normal(bptt, 5)))
-        # There's a very small chance that it could select a very long sequence length resulting in OOM
-        # seq_len = min(seq_len, args.bptt + 10)
-
-        lr2 = optimizer.param_groups[0]['lr']
-        optimizer.param_groups[0]['lr'] = lr2 * seq_len / args.bptt
-        model.train()
-        data, targets = get_batch(train_data, i, args, seq_len=seq_len)
-
-        # Starting each batch, we detach the hidden state from how it was previously produced.
-        # If we didn't, the model would try backpropagating all the way to start of the dataset.
-        hidden = repackage_hidden(hidden)
+    for i, batch in enumerate(train_loader):
+        batch, targets, lengths = make_batch(batch)
+        hidden = model.init_hidden(batch.size(1))
         optimizer.zero_grad()
 
-        output, hidden, rnn_hs, dropped_rnn_hs = model(data, hidden, return_h=True)
+        output, hidden, rnn_hs, dropped_rnn_hs = model(batch, hidden, return_h=True)
         # output, hidden = model(data, hidden, return_h=False)
-        raw_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets)
+        decoded = model.decoder(output)
+        raw_loss = criterion(decoded, targets.view(-1))
 
         loss = raw_loss
         # Activiation Regularization
@@ -231,23 +222,22 @@ def train():
         loss.backward()
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
-        if args.clip: torch.nn.utils.clip_grad_norm_(params, args.clip)
+        if args.clip:
+            nn.utils.clip_grad_norm_(params, args.clip)
         optimizer.step()
 
-        total_loss += raw_loss.data
-        optimizer.param_groups[0]['lr'] = lr2
-        if batch % args.log_interval == 0 and batch > 0:
-            cur_loss = total_loss.item() / args.log_interval
+        total_loss += raw_loss.data * batch.size(1)
+        total_items += batch.size(1)
+        if (i + 1) % args.log_interval == 0:
+            cur_loss = total_loss.item() / total_items
             elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | '
-                  'loss {:5.2f} | ppl {:8.2f} | bpc {:8.3f}'.format(
-                epoch, batch, len(train_data) // args.bptt, optimizer.param_groups[0]['lr'],
-                              elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), cur_loss / math.log(2)))
-            total_loss = 0
+            logger.info(
+                '| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | '
+                'loss {:5.2f} | ppl {:8.2f} | bpc {:8.3f}'.format(
+                    epoch, i + 1, len(train_loader), optimizer.param_groups[0]['lr'],
+                    elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), cur_loss / math.log(2))
+            )
             start_time = time.time()
-        ###
-        batch += 1
-        i += seq_len
 
 
 # Loop over epochs.
@@ -263,54 +253,61 @@ try:
         optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(params, lr=args.lr, betas=(0, 0.999), eps=1e-9, weight_decay=args.wdecay)
-        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.5, patience=2, threshold=0)
+        scheduler = lr_scheduler.lr_scheduler.StepLR(optimizer, 25, 0.5)
     for epoch in range(1, args.epochs + 1):
         epoch_start_time = time.time()
         train()
+        dev_f1 = test(model, corpus, (tree_corpus.valid_sens, tree_corpus.valid_trees), args.cuda, args.evalb_dir)
+        test_f1 = test(model, corpus, (tree_corpus.test_sens, tree_corpus.test_trees), args.cuda, args.evalb_dir)
         if 't0' in optimizer.param_groups[0]:
             tmp = {}
             for prm in model.parameters():
                 tmp[prm] = prm.data.clone()
                 prm.data = optimizer.state[prm]['ax'].clone()
 
-            val_loss2 = evaluate(val_data, eval_batch_size)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                  'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-                epoch, (time.time() - epoch_start_time), val_loss2, math.exp(val_loss2), val_loss2 / math.log(2)))
-            print('-' * 89)
+            val_loss2 = evaluate(val_loader, args.batch_size)
+            logger.info('-' * 89)
+            logger.info('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                  'valid ppl {:8.2f} | valid bpc {:8.3f} | dev f1 {:8.3f} | test f1 {:8.3f}'.format(
+                epoch, (time.time() - epoch_start_time), val_loss2, math.exp(val_loss2), val_loss2 / math.log(2),
+                dev_f1, test_f1)
+            )
+            logger.info('-' * 89)
 
             if val_loss2 < stored_loss:
                 model_save(args.save)
-                print('Saving Averaged!')
+                logger.info('Saving Averaged!')
                 stored_loss = val_loss2
 
             for prm in model.parameters():
                 prm.data = tmp[prm].clone()
 
             if epoch == args.finetuning:
-                print('Switching to finetuning')
+                logger.info('Switching to finetuning')
                 optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
+
                 best_val_loss = []
 
             if epoch > args.finetuning and len(best_val_loss) > args.nonmono and val_loss2 > min(
                     best_val_loss[:-args.nonmono]):
-                print('Done!')
+                logger.info('Done!')
                 import sys
 
                 sys.exit(1)
 
         else:
-            val_loss = evaluate(val_data, eval_batch_size)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                  'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-                epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2)))
-            print('-' * 89)
+            val_loss = evaluate(val_loader, args.batch_size)
+            logger.info('-' * 89)
+            logger.info('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                        'valid ppl {:8.2f} | valid bpc {:8.3f} | dev f1 {:8.3f} | test f1 {:8.3f}'.format(
+                epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2),
+                dev_f1, test_f1)
+            )
+            logger.info('-' * 89)
 
             if val_loss < stored_loss:
                 model_save(args.save)
-                print('Saving model (new best validation)')
+                logger.info('Saving model (new best validation)')
                 stored_loss = val_loss
 
             if args.optimizer == 'adam':
@@ -318,29 +315,31 @@ try:
 
             if args.optimizer == 'sgd' and 't0' not in optimizer.param_groups[0] and (
                     len(best_val_loss) > args.nonmono and val_loss > min(best_val_loss[:-args.nonmono])):
-                print('Switching to ASGD')
+                logger.info('Switching to ASGD')
                 optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
 
             if epoch in args.when:
-                print('Saving model before learning rate decreased')
+                logger.info('Saving model before learning rate decreased')
                 model_save('{}.e{}'.format(args.save, epoch))
-                print('Dividing learning rate by 10')
+                logger.info('Dividing learning rate by 10')
                 optimizer.param_groups[0]['lr'] /= 10.
 
             best_val_loss.append(val_loss)
-
-        print("PROGRESS: {}%".format((epoch / args.epochs) * 100))
+        for idx in range(0, 55*5, 55):
+            dev_f1 = test(model, corpus, (tree_corpus.valid_sens[idx:idx+55], tree_corpus.valid_trees[idx:idx+55]), args.cuda, args.evalb_dir)
+            logger.info('| few-shot dev f1 {:5.2f} |'.format(dev_f1))
+        logger.info("PROGRESS: {}%".format((epoch / args.epochs) * 100))
 
 except KeyboardInterrupt:
-    print('-' * 89)
-    print('Exiting from training early')
+    logger.info('-' * 89)
+    logger.info('Exiting from training early')
 
 # Load the best saved model.
 model_load(args.save)
 
 # Run on test data.
-test_loss = evaluate(test_data, test_batch_size)
-print('=' * 89)
-print('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
+test_loss = evaluate(test_loader, args.batch_size)
+logger.info('=' * 89)
+logger.info('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
     test_loss, math.exp(test_loss), test_loss / math.log(2)))
-print('=' * 89)
+logger.info('=' * 89)

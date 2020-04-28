@@ -1,4 +1,38 @@
+import os
+import subprocess
 import torch
+import tempfile
+import re
+import nltk
+
+punctuation_tags = ['.', ',', ':', '-LRB-', '-RRB-', '\'\'', '``']
+
+
+def list2tree(node):
+    if isinstance(node, list):
+        tree = []
+        for child in node:
+            tree.append(list2tree(child))
+        return nltk.Tree('NT', tree)
+    elif isinstance(node, tuple):
+        return nltk.Tree(node[1], [node[0]])
+
+
+def process_tree(node):  # remove punct from tree
+    if isinstance(node, str):
+        return node
+    label = node.label()
+    if label in punctuation_tags:
+        return None
+    children = list()
+    for child in node:
+        proc_child = process_tree(child)
+        if proc_child is not None:
+            children.append(proc_child)
+    if len(children) > 0:
+        return nltk.Tree(label, children)
+    else:
+        return None
 
 
 def repackage_hidden(h):
@@ -22,6 +56,15 @@ def batchify(data, bsz, args):
     return data
 
 
+def make_batch(source):
+    targets = source[:, 1:].t().contiguous()
+    source = source[:, :-1].t().contiguous()
+    if torch.cuda.is_available():
+        targets = targets.cuda()
+        source = source.cuda()
+    return source, targets, source.size(0)
+
+
 def get_batch(source, i, args, seq_len=None, evaluation=False):
     seq_len = min(seq_len if seq_len else args.bptt, len(source) - 1 - i)
     data = source[i:i+seq_len]
@@ -40,43 +83,24 @@ def load_embeddings_txt(path):
   }
   return matrix, word_to_index, index_to_word
 
-def evalb(pred_tree_list, targ_tree_list):
-    import os
-    import subprocess
-    import tempfile
-    import re
-    import nltk
 
+def evalb(pred_tree_list, targ_tree_list, evalb_dir='./EVALB'):
     temp_path = tempfile.TemporaryDirectory(prefix="evalb-")
     temp_file_path = os.path.join(temp_path.name, "pred_trees.txt")
     temp_targ_path = os.path.join(temp_path.name, "true_trees.txt")
     temp_eval_path = os.path.join(temp_path.name, "evals.txt")
 
-    print("Temp: {}, {}".format(temp_file_path, temp_targ_path))
     temp_tree_file = open(temp_file_path, "w")
     temp_targ_file = open(temp_targ_path, "w")
 
     for pred_tree, targ_tree in zip(pred_tree_list, targ_tree_list):
-        def process_str_tree(str_tree):
-            return re.sub('[ |\n]+', ' ', str_tree)
-
-        def list2tree(node):
-            if isinstance(node, list):
-                tree = []
-                for child in node:
-                    tree.append(list2tree(child))
-                return nltk.Tree('<unk>', tree)
-            elif isinstance(node, str):
-                return nltk.Tree('<word>', [node])
-
-        temp_tree_file.write(process_str_tree(str(list2tree(pred_tree)).lower()) + '\n')
-        temp_targ_file.write(process_str_tree(str(list2tree(targ_tree)).lower()) + '\n')
-
+        temp_tree_file.write(re.sub('[ |\n]+', ' ', str(process_tree(list2tree(pred_tree)))) + '\n')
+        temp_targ_file.write(re.sub('[ |\n]+', ' ', str(process_tree(targ_tree))) + '\n')
+    
     temp_tree_file.close()
     temp_targ_file.close()
 
-    evalb_dir = os.path.join(os.getcwd(), "EVALB")
-    evalb_param_path = os.path.join(evalb_dir, "COLLINS.prm")
+    evalb_param_path = os.path.join(evalb_dir, "fhs.prm")
     evalb_program_path = os.path.join(evalb_dir, "evalb")
     command = "{} -p {} {} {} > {}".format(
         evalb_program_path,
@@ -101,10 +125,5 @@ def evalb(pred_tree_list, targ_tree_list):
                 break
 
     temp_path.cleanup()
-
-    print('-' * 80)
-    print('Evalb Prec:', evalb_precision,
-          ', Evalb Reca:', evalb_recall,
-          ', Evalb F1:', evalb_fscore)
 
     return evalb_fscore
