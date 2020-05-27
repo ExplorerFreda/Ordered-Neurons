@@ -28,27 +28,27 @@ parser.add_argument('--chunk_size', type=int, default=10,
                     help='number of units per chunk')
 parser.add_argument('--nlayers', type=int, default=3,
                     help='number of layers')
-parser.add_argument('--lr', type=float, default=30,
+parser.add_argument('--lr', type=float, default=0.001,
                     help='initial learning rate')
 parser.add_argument('--clip', type=float, default=0.25,
                     help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=200,
+parser.add_argument('--epochs', type=int, default=100,
                     help='upper epoch limit')
 parser.add_argument('--batch_size', type=int, default=80, metavar='N',
                     help='batch size')
 parser.add_argument('--bptt', type=int, default=70,
                     help='sequence length')
-parser.add_argument('--dropout', type=float, default=0.4,
+parser.add_argument('--dropout', type=float, default=0.45,
                     help='dropout applied to layers (0 = no dropout)')
-parser.add_argument('--dropouth', type=float, default=0.25,
+parser.add_argument('--dropouth', type=float, default=0.3,
                     help='dropout for rnn layers (0 = no dropout)')
 parser.add_argument('--dropouti', type=float, default=0.5,
                     help='dropout for input embedding layers (0 = no dropout)')
 parser.add_argument('--dropoute', type=float, default=0.1,
                     help='dropout to remove words from embedding layer (0 = no dropout)')
-parser.add_argument('--wdrop', type=float, default=0.4,
+parser.add_argument('--wdrop', type=float, default=0.45,
                     help='amount of weight dropout to apply to the RNN hidden to hidden matrix')
-parser.add_argument('--seed', type=int, default=1111,
+parser.add_argument('--seed', type=int, default=4321,
                     help='random seed')
 parser.add_argument('--nonmono', type=int, default=5,
                     help='random seed')
@@ -253,7 +253,7 @@ try:
         optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(params, lr=args.lr, betas=(0, 0.999), eps=1e-9, weight_decay=args.wdecay)
-        scheduler = lr_scheduler.lr_scheduler.StepLR(optimizer, 25, 0.5)
+        scheduler = lr_scheduler.StepLR(optimizer, 50, 0.5)
     for epoch in range(1, args.epochs + 1):
         epoch_start_time = time.time()
         train()
@@ -325,9 +325,11 @@ try:
                 optimizer.param_groups[0]['lr'] /= 10.
 
             best_val_loss.append(val_loss)
-        for idx in range(0, 55*5, 55):
-            dev_f1 = test(model, corpus, (tree_corpus.valid_sens[idx:idx+55], tree_corpus.valid_trees[idx:idx+55]), args.cuda, args.evalb_dir)
-            logger.info('| few-shot dev f1 {:5.2f} |'.format(dev_f1))
+        for few_num in [15, 25, 55, 105]:
+            logger.info('few-shot num: {:d}'.format(few_num))
+            for idx in range(0, few_num*5, few_num):
+                dev_f1 = test(model, corpus, (tree_corpus.valid_sens[idx:idx+few_num], tree_corpus.valid_trees[idx:idx+few_num]), args.cuda, args.evalb_dir)
+                logger.info('| few-shot dev f1 {:5.2f} |'.format(dev_f1))
         logger.info("PROGRESS: {}%".format((epoch / args.epochs) * 100))
 
 except KeyboardInterrupt:
